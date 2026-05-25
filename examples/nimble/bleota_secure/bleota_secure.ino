@@ -4,10 +4,10 @@
   The service advertises itself as: 00008018-0000-1000-8000-00805f9b34fb
   If any of this is defined:
   MODEL
-  SERIAL_NUM 
-  FW_VERSION  
-  HW_VERSION 
-  MANUFACTURER 
+  SERIAL_NUM
+  FW_VERSION
+  HW_VERSION
+  MANUFACTURER
   the DIS service is added
 
   The flow of creating the BLE server is:
@@ -34,12 +34,25 @@
 
   throw it all in one file
     - cat ota.ino.bin signature.sign > ota.bin
-	
+
   use this file to perform the update
 
 */
 
-#include "NimBLEOTA.h"
+// Legacy Force NimBLE-Arduino (h2zero) BLE stack on core ≥ 3.3.0+ (External dependency)
+#define BLEOTA_USE_NIMBLE
+#include <NimBLEDevice.h>
+
+#include <NimBLEOTA.h>
+
+// Auto Generating persistent RSA 2048-bit key pair files
+#include <LittleFS.h>
+#include <esp_task_wdt.h>
+#include <mbedtls/pk.h>
+#include <mbedtls/rsa.h>
+#include <mbedtls/ctr_drbg.h>
+#include <mbedtls/entropy.h>
+
 
 #define MODEL "1"
 #define SERIAL_NUM "1234"
@@ -47,7 +60,10 @@
 #define HW_VERSION "1"
 #define MANUFACTURER "Espressif"
 
-const char pub_key[] = "-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAw/rrOWrykXdTPFwZzljd\nPuuhkRDQUJQu0et5dWNd4ntbh+Qp9qDiZMEj9PcUkw6VUCWFTcSFkOR4i3M+H3g3\nJsKGe5y45DGK8HvgOAnGGUtb0/V2UVZAqiUzJ2cXSK+1688/kWRBSv6OTMXFg2Fa\nGnaIEupUIJZfnBjJmZOhqJll+kxvkxE3CjbnnP8SZ31ybItPV3DyML/7RZ3gMBB5\ngVh44kzAIzPD+NtSSU/RNbWOi3rgNPx1SLzUPjThkHAkVRJ96pWEctiblv2XwoIm\n1ZJEeeda3O46+zCpsI1Ph5oo8mi4QWj1MvkQldo3XtLWRtH/IbMLEgRSR5y054Tg\n0QIDAQAB\n-----END PUBLIC KEY-----";
+char* pub_key = nullptr;
+inline constexpr const char* pubKeyFile = "/rsa_key.pub";
+inline constexpr const char* privKeyFile = "/priv_key.pem";
+bool rsaKeys = false;
 
 NimBLEOTAClass BLEOTA;
 
@@ -69,6 +85,16 @@ class ServerCallbacks : public BLEServerCallbacks {
 
 void setup() {
   Serial.begin(115200);
+  LittleFS.begin(true);
+
+  // Add the public key (rsa_key.pub content)
+  generateKeys();
+  pub_key = loadPemFromLittleFS(pubKeyFile);
+  if (!pub_key) {
+    Serial.println("Error: Failed to generate RSA key pair. Rebooting...");
+    delay(30000);
+    ESP.restart();
+  }
 
   // Create the BLE Device
   BLEDevice::init("ESP32");
@@ -76,6 +102,7 @@ void setup() {
   // Create the BLE Server
   pServer = BLEDevice::createServer();
   pServer->setCallbacks(new ServerCallbacks());
+
 
   // Add OTA Service with security
   BLEOTA.begin(pServer, true);
@@ -101,8 +128,7 @@ void setup() {
   // Start advertising
   BLEAdvertising* pAdvertising = BLEDevice::getAdvertising();
   pAdvertising->addServiceUUID(BLEOTA.getBLEOTAuuid());
-  pAdvertising->setScanResponse(false);
-  pAdvertising->setMinPreferred(0x0);  // set value to 0x00 to not advertise this parameter
+  pAdvertising->enableScanResponse(false);
   BLEDevice::startAdvertising();
 
 #ifdef FW_VERSION
@@ -127,4 +153,116 @@ void loop() {
   }
   BLEOTA.process();
   delay(1000);
+}
+
+
+// Add the public key (rsa_key.pub content)
+char* loadPemFromLittleFS(const char* keyfile) {
+  // open public PEM file
+  File pubFile = LittleFS.open(keyfile, "r");
+  if (!pubFile) {
+    Serial.print("LittleFS: cannot access '");
+    Serial.print(keyfile);
+    Serial.println("': No such file or directory");
+    return nullptr;
+  }
+  size_t pem_len = pubFile.size();
+  unsigned char *pubKey = (unsigned char*)malloc(pem_len + 1);
+  if (!pubKey) {
+    pubFile.close();
+    Serial.println("Failed to allocate memory for public key");
+    return nullptr;
+  }
+  pubFile.read(pubKey, pem_len);
+  pubFile.close();
+  pubKey[pem_len] = '\0';
+  return (char*)pubKey;
+}
+
+
+// generate RSA 2048-bit private.pem + public.pem key pair files
+void generateKeys() {
+  if (rsaKeys) return; // already checked
+  bool keysValid = false;
+
+  // check first 10 bytes match "^-----BEGIN"
+  if (LittleFS.exists(privKeyFile) && LittleFS.exists(pubKeyFile)) {
+    File privFile = LittleFS.open(privKeyFile, "r");
+    File pubFile  = LittleFS.open(pubKeyFile, "r");
+    if (privFile && pubFile) {
+      char header[11] = {0};
+      privFile.readBytes(header, 10);
+      if (strncmp(header, "-----BEGIN", 10) == 0) {
+        pubFile.readBytes(header, 10);
+        if (strncmp(header, "-----BEGIN", 10) == 0) {
+          keysValid = true;
+        }
+      }
+    }
+    privFile.close();
+    pubFile.close();
+  }
+
+  if (!keysValid) {
+    Serial.println("Generating RSA 2048-bit key pair...");
+
+    // Initialize Mbed TLS structures
+    mbedtls_pk_context pk;
+    mbedtls_ctr_drbg_context ctr_drbg;
+    mbedtls_entropy_context entropy;
+    const char *pers = "rsa_gen";
+
+    mbedtls_pk_init(&pk);
+    mbedtls_ctr_drbg_init(&ctr_drbg);
+    mbedtls_entropy_init(&entropy);
+
+    if (mbedtls_ctr_drbg_seed(&ctr_drbg, mbedtls_entropy_func, &entropy, (const unsigned char*)pers, strlen(pers)) != 0) {
+      Serial.println("DRBG seed failed");
+      return;
+    }
+
+    if (mbedtls_pk_setup(&pk, mbedtls_pk_info_from_type(MBEDTLS_PK_RSA)) != 0) {
+      Serial.println("PK setup failed");
+      return;
+    }
+
+    // disable watchdog for this task
+    esp_task_wdt_delete(NULL);
+
+    if (mbedtls_rsa_gen_key(mbedtls_pk_rsa(pk), mbedtls_ctr_drbg_random, &ctr_drbg, 2048, 65537) != 0) {
+      Serial.println("RSA key generation failed");
+      esp_task_wdt_add(NULL);  // re-enable before returning
+      return;
+    }
+    // re-enable watchdog
+    esp_task_wdt_add(NULL);
+
+    // write private key to PEM
+    unsigned char privPem[1792];
+    if (mbedtls_pk_write_key_pem(&pk, privPem, sizeof(privPem)) != 0) {
+      Serial.println("Private key PEM export failed");
+      return;
+    }
+    File fPriv = LittleFS.open(privKeyFile, "w");
+    fPriv.write(privPem, strlen((char*)privPem));
+    fPriv.close();
+
+    // write public key to PEM
+    unsigned char pubPem[512];
+    if (mbedtls_pk_write_pubkey_pem(&pk, pubPem, sizeof(pubPem)) != 0) {
+      Serial.println("Public key PEM export failed");
+      return;
+    }
+    File fPub = LittleFS.open(pubKeyFile, "w");
+    fPub.write(pubPem, strlen((char*)pubPem));
+    fPub.close();
+
+    mbedtls_pk_free(&pk);
+    mbedtls_ctr_drbg_free(&ctr_drbg);
+    mbedtls_entropy_free(&entropy);
+
+    Serial.println("RSA key pair generated.");
+  }
+
+  rsaKeys = true;
 }
