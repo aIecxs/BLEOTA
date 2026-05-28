@@ -64,7 +64,7 @@
 #define HW_VERSION "1"
 #define MANUFACTURER "Espressif"
 
-
+#define BLE_NAME "ESP32"
 const uint32_t BLE_PASSWORD = 123456; // 6-digit
 
 char* pub_key = nullptr;
@@ -116,7 +116,7 @@ void setup() {
   }
 
   // Create the BLE Device
-  BLEDevice::init("ESP32");
+  BLEDevice::init(BLE_NAME);
 
   // Create the BLE Server
   pServer = BLEDevice::createServer();
@@ -147,7 +147,7 @@ void setup() {
   // Start advertising
   BLEAdvertising* pAdvertising = BLEDevice::getAdvertising();
   pAdvertising->addServiceUUID(BLEOTA.getBLEOTAuuid());
-  pAdvertising->setName("ESP32");
+  pAdvertising->setName(BLE_NAME);
   pAdvertising->enableScanResponse(true);
   pAdvertising->start();
   pServer->advertiseOnDisconnect(true);
