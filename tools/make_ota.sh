@@ -45,6 +45,11 @@ SCRIPT_PATH=$(realpath "${0}")
 SKETCH_DIR=${SCRIPT_PATH%/*}     # Strips the filename from the back (equivalent to dirname)
 SKETCH_NAME=${SKETCH_DIR##*/}    # Deletes everything up to the last / from the front (equivalent to basename)
 
+if [ -z "$(find "$SKETCH_DIR" -maxdepth 1 -iname "$SKETCH_NAME.ino" 2>/dev/null)" ]; then
+  echo "Error: copy $(cygpath -w "$SCRIPT_PATH") -> into Sketch Directory!" >&2
+  exit 1
+fi
+
 #{build.source.path}=SKETCH_DIR
 #{build.project_name}=SKETCH_NAME
 #{build.path}=SKETCH_TEMP
@@ -133,6 +138,9 @@ SKETCH_TEMP=$(realpath "$NEWEST_TEMP_DIR")
 # Grabs the content inside the quotes, splits at the comma to take only the first path
 HARDWARE_WIN_PATH=$(grep -m 1 '"hardwareFolders"' "$SKETCH_TEMP/build.options.json" | sed -n 's/.*"hardwareFolders":\s*"\([^,"]*\).*/\1/p')
 
+# Extract the FQBN (Fully Qualified Board Name) from build.options.json
+FQBN=$(grep '"fqbn"' "$SKETCH_TEMP/build.options.json" | sed -n 's/.*"fqbn":\s*"\(.*\)",.*/\1/p')
+
 # Converts the Windows backslash path to a clean Git Bash Unix path
 HARDWARE_DIR=$(cygpath -u "$HARDWARE_WIN_PATH")
 
@@ -179,9 +187,15 @@ read -p "Dumping LittleFS partition at Offset: $LITTLEFS_OFFSET with Size: $LITT
 echo "" # New line after key press
 
 #from build.options.json {fqbn}
-#{board_id} echo "esp32:esp32:esp32s3" | sed -E 's/^[^:]+:[^:]+:([^:,]+).*/\1/'
-#{build.mcu} echo "esp32:esp32:lilygo_t_display_s3:MCU=esp32s3,FlashSize=16M" | sed -E 's/^([^:]+:[^:]+:[^:]+:).*MCU=([^,]+).*/\2/'
-"$ESPTOOL_EXE" --chip esp32 --port "$COM_PORT" --baud 921600 read-flash "$LITTLEFS_OFFSET" "$LITTLEFS_SIZE" "$IMAGE_BIN"
+board_id="$(echo "$FQBN" | sed -nE 's/^[^:]+:[^:]+:([^:,]+).*/\1/p')"
+build_mcu="$(echo "$FQBN" | sed -nE 's/^([^:]+:[^:]+:[^:]+:).*MCU=([^,]+).*/\2/p')"
+if [ -n "$build_mcu" ]; then
+  chip_variant="$build_mcu"
+else
+  chip_variant="$board_id"
+fi
+
+"$ESPTOOL_EXE" --chip "$chip_variant" --port "$COM_PORT" --baud 921600 read-flash "$LITTLEFS_OFFSET" "$LITTLEFS_SIZE" "$IMAGE_BIN"
 
 if [ $? -ne 0 ]; then
   echo "Error: Close Serial Monitor on $COM_PORT." >&2
@@ -257,6 +271,7 @@ fi
 
 cp "$PRIVATE_KEY_FILE" "$DUMP_DIR"
 cp "$PUBLIC_KEY_FILE" "$DUMP_DIR"
+cp -a "$EXTRACT_DIR" "$SKETCH_DIR"
 
 # 17. Open Windows Explorer in the dump directory
 explorer.exe "$(cygpath -w "$DUMP_DIR")"
