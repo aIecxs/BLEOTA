@@ -39,11 +39,15 @@
 
 */
 
-// Legacy Force NimBLE-Arduino (h2zero) BLE stack on core ≥ 3.3.0+ (External dependency)
-#define BLEOTA_USE_NIMBLE
-#include <NimBLEDevice.h>
+// Enable Security
+#define BLEOTA_SET_SECURITY_AUTH
 
-#include <NimBLEOTA.h>
+// Legacy Force NimBLE-Arduino (h2zero) BLE stack on core ≥ 3.3.0+ (External dependency)
+#include <BLEOTA.h>
+#include <NimBLEDevice.h>
+#ifndef BLEOTA_USE_NIMBLE
+  #error "#define BLEOTA_USE_NIMBLE -> hardcode straight in {otherLibrariesFolders}/BLEOTA/src -> NimBLEOTA.h library header!"
+#endif
 
 // Auto Generating persistent RSA 2048-bit key pair files
 #include <LittleFS.h>
@@ -60,15 +64,18 @@
 #define HW_VERSION "1"
 #define MANUFACTURER "Espressif"
 
+
+const uint32_t BLE_PASSWORD = 123456; // 6-digit
+
 char* pub_key = nullptr;
 inline constexpr const char* pubKeyFile = "/rsa_key.pub";
 inline constexpr const char* privKeyFile = "/priv_key.pem";
-bool rsaKeys = false;
 
 NimBLEOTAClass BLEOTA;
 
 BLEServer* pServer = NULL;
 
+bool rsaKeys = false;
 bool deviceConnected = false;
 bool oldDeviceConnected = false;
 
@@ -76,11 +83,23 @@ class ServerCallbacks : public BLEServerCallbacks {
   void onConnect(BLEServer* pServer, NimBLEConnInfo& connInfo) {
     deviceConnected = true;
     pServer->updateConnParams(connInfo.getConnHandle(), 0x06, 0x12, 0, 2000);
+#ifdef BLEOTA_SET_SECURITY_AUTH
+    BLEDevice::startSecurity(connInfo.getConnHandle());
+#endif
   };
 
   void onDisconnect(BLEServer* pServer, NimBLEConnInfo& connInfo, int reason) {
     deviceConnected = false;
   }
+
+#ifdef BLEOTA_SET_SECURITY_AUTH
+  void onAuthenticationComplete(NimBLEConnInfo& connInfo)
+  {
+    if (!connInfo.isAuthenticated()) {
+      pServer->disconnect(connInfo.getConnHandle());
+    }
+  }
+#endif
 };
 
 void setup() {
@@ -103,7 +122,6 @@ void setup() {
   pServer = BLEDevice::createServer();
   pServer->setCallbacks(new ServerCallbacks());
 
-
   // Add OTA Service with security
   BLEOTA.begin(pServer, true);
   // Add pub key
@@ -125,11 +143,26 @@ void setup() {
 #endif
 
   BLEOTA.init();
+
   // Start advertising
   BLEAdvertising* pAdvertising = BLEDevice::getAdvertising();
   pAdvertising->addServiceUUID(BLEOTA.getBLEOTAuuid());
-  pAdvertising->enableScanResponse(false);
-  BLEDevice::startAdvertising();
+  pAdvertising->setName("ESP32");
+  pAdvertising->enableScanResponse(true);
+  pAdvertising->start();
+  pServer->advertiseOnDisconnect(true);
+
+#ifdef BLEOTA_SET_SECURITY_AUTH
+  // BLE Security configurations
+  BLEDevice::setMTU(BLE_ATT_MTU_MAX);
+  BLEDevice::setSecurityAuth(true, true, true);
+  BLEDevice::setSecurityIOCap(BLE_HS_IO_DISPLAY_ONLY);
+  BLEDevice::setSecurityPasskey(BLE_PASSWORD);
+  uint8_t init_key = BLE_SM_PAIR_KEY_DIST_ENC | BLE_SM_PAIR_KEY_DIST_ID;
+  uint8_t rsp_key = BLE_SM_PAIR_KEY_DIST_ENC | BLE_SM_PAIR_KEY_DIST_ID;
+  BLEDevice::setSecurityInitKey(init_key);
+  BLEDevice::setSecurityRespKey(rsp_key);
+#endif
 
 #ifdef FW_VERSION
   Serial.print("Firmware Version: ");

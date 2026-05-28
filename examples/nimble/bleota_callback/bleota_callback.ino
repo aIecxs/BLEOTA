@@ -94,8 +94,9 @@ void setup() {
   // Start advertising
   BLEAdvertising* pAdvertising = BLEDevice::getAdvertising();
   pAdvertising->addServiceUUID(BLEOTA.getBLEOTAuuid());
-  pAdvertising->setScanResponse(false);
-  pAdvertising->setMinPreferred(0x0);  // set value to 0x00 to not advertise this parameter
+  pAdvertising->enableScanResponse(true);
+  pAdvertising->setName("ESP32");       
+  pAdvertising->setPreferredParams(0x06,0x120); 
   BLEDevice::startAdvertising();
 
 #ifdef FW_VERSION

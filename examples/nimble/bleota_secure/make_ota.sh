@@ -45,6 +45,13 @@ SCRIPT_PATH=$(realpath "${0}")
 SKETCH_DIR=${SCRIPT_PATH%/*}     # Strips the filename from the back (equivalent to dirname)
 SKETCH_NAME=${SKETCH_DIR##*/}    # Deletes everything up to the last / from the front (equivalent to basename)
 
+#{build.source.path}=SKETCH_DIR
+#{build.project_name}=SKETCH_NAME
+#{build.path}=SKETCH_TEMP
+#{runtime.platform.path}=HARDWARE_DIR
+
+#{build.chip_variant}=
+
 LOG_DIR="$APPDATA/Arduino IDE"
 LOG_LINE=""
 
@@ -171,6 +178,9 @@ mkdir -p "$EXTRACT_DIR"
 read -p "Dumping LittleFS partition at Offset: $LITTLEFS_OFFSET with Size: $LITTLEFS_SIZE from $COM_PORT... press any key..." -n 1 -r
 echo "" # New line after key press
 
+#from build.options.json {fqbn}
+#{board_id} echo "esp32:esp32:esp32s3" | sed -E 's/^[^:]+:[^:]+:([^:,]+).*/\1/'
+#{build.mcu} echo "esp32:esp32:lilygo_t_display_s3:MCU=esp32s3,FlashSize=16M" | sed -E 's/^([^:]+:[^:]+:[^:]+:).*MCU=([^,]+).*/\2/'
 "$ESPTOOL_EXE" --chip esp32 --port "$COM_PORT" --baud 921600 read-flash "$LITTLEFS_OFFSET" "$LITTLEFS_SIZE" "$IMAGE_BIN"
 
 if [ $? -ne 0 ]; then

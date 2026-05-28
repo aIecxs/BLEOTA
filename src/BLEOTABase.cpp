@@ -1,4 +1,4 @@
-#include "NimBLEOTA.h"
+#include "BLEOTA.h"
 
 BLEOTABase::BLEOTABase() {
 }
