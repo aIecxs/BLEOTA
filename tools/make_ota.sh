@@ -42,20 +42,13 @@
 
 # 1. Determine absolute paths
 SCRIPT_PATH=$(realpath "${0}")
-SKETCH_DIR=${SCRIPT_PATH%/*}     # Strips the filename from the back (equivalent to dirname)
-SKETCH_NAME=${SKETCH_DIR##*/}    # Deletes everything up to the last / from the front (equivalent to basename)
+build_source_path=${SCRIPT_PATH%/*}     # Strips the filename from the back (equivalent to dirname)
+build_project_name=${build_source_path##*/}    # Deletes everything up to the last / from the front (equivalent to basename)
 
-if [ -z "$(find "$SKETCH_DIR" -maxdepth 1 -iname "$SKETCH_NAME.ino" 2>/dev/null)" ]; then
+if [ -z "$(find "$build_source_path" -maxdepth 1 -iname "$build_project_name.ino" 2>/dev/null)" ]; then
   echo "Error: copy $(cygpath -w "$SCRIPT_PATH") -> into Sketch Directory!" >&2
   exit 1
 fi
-
-#{build.source.path}=SKETCH_DIR
-#{build.project_name}=SKETCH_NAME
-#{build.path}=SKETCH_TEMP
-#{runtime.platform.path}=HARDWARE_DIR
-
-#{build.chip_variant}=
 
 LOG_DIR="$APPDATA/Arduino IDE"
 LOG_LINE=""
@@ -63,7 +56,7 @@ LOG_LINE=""
 while IFS= read -r log_file; do
   if [ -f "$log_file" ]; then
     # Searches bottom-up for the most recent entry matching Sketch Name
-    LOG_LINE=$(tac "$log_file" | grep -E -m 1 "20[0-9]{2}-[0-9]{2}-[0-9]{2}.*root.INFO.Received.port.after.upload.*$SKETCH_NAME")
+    LOG_LINE=$(tac "$log_file" | grep -E -m 1 "20[0-9]{2}-[0-9]{2}-[0-9]{2}.*root.INFO.Received.port.after.upload.*$build_project_name")
     
     # If we found a match, exit the loop
     if [ -n "$LOG_LINE" ]; then
@@ -73,16 +66,8 @@ while IFS= read -r log_file; do
   fi
 done < <(find "$LOG_DIR" -maxdepth 1 -iname "20[0-9][0-9]-[0-9][0-9]-[0-9][0-9]_log.log" | sort -r)
 
-if [ -z "$LOG_LINE" ]; then
-  echo "Error: COM Port not found. Restart Arduino IDE and Upload Sketch first." >&2
-  exit 1
-fi
-
-# Extracts the COM port directly from the "arduino+serial://..." block
-COM_PORT=$(echo "$LOG_LINE" | sed -n 's/.*arduino+serial:\/\/\([^,]*\),.*/\1/p')
-
 # Convert to Windows format for JSON path matching
-WINDOWS_PATH=$(cygpath -w "$SKETCH_DIR")
+WINDOWS_PATH=$(cygpath -w "$build_source_path")
 TARGET_LOCATION=$(echo "$WINDOWS_PATH" | sed 's/\\/\\\\/g' | tr '[:upper:]' '[:lower:]')
 
 # 2. Define search paths for both possible temp directories
@@ -108,7 +93,7 @@ done
 
 # Safety check
 if [ ${#MATCHING_DIRS[@]} -eq 0 ]; then
-  echo "Error: No build directory found for $SKETCH_NAME sketch." >&2
+  echo "Error: No build directory found for $build_project_name sketch." >&2
   exit 1
 fi
 
@@ -132,35 +117,46 @@ if [ -z "$NEWEST_TEMP_DIR" ]; then
 fi
 
 # 5. Finalize output: Run through realpath to unify slashes
-SKETCH_TEMP=$(realpath "$NEWEST_TEMP_DIR")
+build_path=$(realpath "$NEWEST_TEMP_DIR")
 
-# 6. Extract and format the hardware folder path
-# Grabs the content inside the quotes, splits at the comma to take only the first path
-HARDWARE_WIN_PATH=$(grep -m 1 '"hardwareFolders"' "$SKETCH_TEMP/build.options.json" | sed -n 's/.*"hardwareFolders":\s*"\([^,"]*\).*/\1/p')
+# 6. Extract and format the user library folder and hardware folder paths
+HARDWARE_WIN_PATH=$(grep -m 1 '"hardwareFolders"' "$build_path/build.options.json" | sed -n 's/.*"hardwareFolders":\s*"\([^,",]*\).*/\1/p')
+USER_LIB_WIN_PATH=$(grep -m 1 '"otherLibrariesFolders"' "$build_path/build.options.json" | sed -n 's/.*"otherLibrariesFolders":\s*"\([^,",]*\).*/\1/p')
 
-# Extract the FQBN (Fully Qualified Board Name) from build.options.json
-FQBN=$(grep '"fqbn"' "$SKETCH_TEMP/build.options.json" | sed -n 's/.*"fqbn":\s*"\(.*\)",.*/\1/p')
+# Converts the Windows backslash paths to clean Git Bash Unix paths
+runtime_platform_path=$(cygpath -u "$HARDWARE_WIN_PATH")
+USER_LIB=$(cygpath -u "$USER_LIB_WIN_PATH")
 
-# Converts the Windows backslash path to a clean Git Bash Unix path
-HARDWARE_DIR=$(cygpath -u "$HARDWARE_WIN_PATH")
+# Extract {build.fqbn} from build.options.json
+FQBN=$(grep '"fqbn"' "$build_path/build.options.json" | sed -n 's/.*"fqbn":\s*"\(.*\)",.*/\1/p')
+
+# Extract {build.chip_variant} from build.options.json
+board_id="$(echo "$FQBN" | sed -nE 's/^[^:]+:[^:]+:([^:,]+).*/\1/p')"
+build_mcu="$(echo "$FQBN" | sed -nE 's/^([^:]+:[^:]+:[^:]+:).*MCU=([^,]+).*/\2/p')"
+if [ -n "$build_mcu" ]; then
+  build_chip_variant="$build_mcu"
+else
+  build_chip_variant="$board_id"
+fi
 
 # 7. Define output directory inside the build directory
-DUMP_DIR="$SKETCH_TEMP/${SCRIPT_PATH##*/}"
+DUMP_DIR="$build_path/${SCRIPT_PATH##*/}"
 DUMP_DIR="${DUMP_DIR%.*}"
 mkdir -p "$DUMP_DIR"
 
 # 8. Find the newest version of esptool.exe and mklittlefs.exe
-# Using sort -V (version sort) to reliably pick the highest version number
-ESPTOOL_EXE=$(find "$HARDWARE_DIR/../../../tools/esptool_py" -name "esptool.exe" 2>/dev/null | sort -V | tail -n 1)
-MKLITTLEFS_EXE=$(find "$HARDWARE_DIR/../../../tools/mklittlefs" -name "mklittlefs.exe" 2>/dev/null | sort -V | tail -n 1)
+ESPTOOL_EXE=$(find "$runtime_platform_path/../../../tools/esptool_py" -iname "esptool.exe" 2>/dev/null | sort -V | tail -n 1)
+MKLITTLEFS_EXE=$(find "$runtime_platform_path/../../../tools/mklittlefs" -iname "mklittlefs.exe" 2>/dev/null | sort -V | tail -n 1)
+PIGZ_EXE="$DUMP_DIR/pigz.exe"
+unzip -o "$USER_LIB/BLEOTA/tools/pigz.zip" -d "$DUMP_DIR" > /dev/null
 
-if [ -z "$ESPTOOL_EXE" ] || [ -z "$MKLITTLEFS_EXE" ]; then
-  echo "Error: Required tools (esptool or mklittlefs) not found." >&2
+if [ $? -ne 0 ] || [ -z "$ESPTOOL_EXE" ] || [ -z "$MKLITTLEFS_EXE" ]; then
+  echo "Error: Required tools (esptool, mklittlefs or pigz) not found." >&2
   exit 1
 fi
 
 # 9. Extract LittleFS/SPIFFS Partition Offset and Size from partitions.csv
-PARTITION_CSV="$SKETCH_TEMP/partitions.csv"
+PARTITION_CSV="$build_path/partitions.csv"
 
 if [ ! -f "$PARTITION_CSV" ]; then
   echo "Error: partitions.csv not found." >&2
@@ -180,98 +176,152 @@ LITTLEFS_SIZE=$(echo "$SPIFFS_ROW" | cut -d',' -f5)
 
 # 10. Dump the LittleFS partition from ESP32 flash memory
 IMAGE_BIN="$DUMP_DIR/littlefs_dump.bin"
-EXTRACT_DIR="$SKETCH_TEMP/data"
+RAW_LITTLEFS_BIN="$DUMP_DIR/littlefs_new.bin"
+EXTRACT_DIR="$build_path/data"
 mkdir -p "$EXTRACT_DIR"
 
-read -p "Dumping LittleFS partition at Offset: $LITTLEFS_OFFSET with Size: $LITTLEFS_SIZE from $COM_PORT... press any key..." -n 1 -r
-echo "" # New line after key press
-
-#from build.options.json {fqbn}
-board_id="$(echo "$FQBN" | sed -nE 's/^[^:]+:[^:]+:([^:,]+).*/\1/p')"
-build_mcu="$(echo "$FQBN" | sed -nE 's/^([^:]+:[^:]+:[^:]+:).*MCU=([^,]+).*/\2/p')"
-if [ -n "$build_mcu" ]; then
-  chip_variant="$build_mcu"
+echo -n "Dumping LittleFS partition... press any key..."
+control_c_handler() {
+  CTRL_C_PRESSED=true
+}
+trap control_c_handler SIGINT
+CTRL_C_PRESSED=false
+SKIP_DUMP=false
+read -s -n 1 KEY_PRESSED
+READ_STATUS=$?
+trap - SIGINT
+if [[ "$KEY_PRESSED" == $'\e' ]] || [ "$CTRL_C_PRESSED" = true ] || [ $READ_STATUS -gt 128 ]; then
+  SKIP_DUMP=true
+  echo " aborted. Using local keys."
+  KEY_SEARCH_DIR="$build_source_path/data"
 else
-  chip_variant="$board_id"
+  KEY_SEARCH_DIR="$EXTRACT_DIR"
 fi
 
-"$ESPTOOL_EXE" --chip "$chip_variant" --port "$COM_PORT" --baud 921600 read-flash "$LITTLEFS_OFFSET" "$LITTLEFS_SIZE" "$IMAGE_BIN"
+if [ "$SKIP_DUMP" = false ]; then
+  if [ -z "$LOG_LINE" ]; then
+    echo "Error: COM Port not found. Restart Arduino IDE and Upload Sketch first." >&2
+    exit 1
+  fi
 
-if [ $? -ne 0 ]; then
-  echo "Error: Close Serial Monitor on $COM_PORT." >&2
-  exit 1
-fi
+  # Extracts the COM port directly from the "arduino+serial://..." block
+  COM_PORT=$(echo "$LOG_LINE" | sed -n 's/.*arduino+serial:\/\/\([^,]*\),.*/\1/p')
 
-# 11. Extract files from the dumped binary image using mklittlefs
-echo "Extracting files from dump image via mklittlefs..."
-"$MKLITTLEFS_EXE" -u "$EXTRACT_DIR" "$IMAGE_BIN"
+  "$ESPTOOL_EXE" --chip "$build_chip_variant" --port "$COM_PORT" --baud 921600 read-flash "$LITTLEFS_OFFSET" "$LITTLEFS_SIZE" "$IMAGE_BIN"
 
-if [ $? -eq 0 ]; then
-  echo "Success! All files extracted to: $EXTRACT_DIR"
-else
-  echo "Error: Failed to unpack the LittleFS image." >&2
-  exit 1
+  if [ $? -ne 0 ]; then
+    echo "Error: Close Serial Monitor on $COM_PORT and try again." >&2
+    exit 1
+  fi
+
+  # 11. Extract files from the dumped binary image using mklittlefs
+  echo "Extracting files from dump image via mklittlefs..."
+  "$MKLITTLEFS_EXE" -u "$EXTRACT_DIR" "$IMAGE_BIN"
+
+  if [ $? -eq 0 ]; then
+    echo "Success! All files extracted to: $EXTRACT_DIR"
+  else
+    echo "Error: Failed to unpack the LittleFS image." >&2
+    exit 1
+  fi
 fi
 
 # 12. Compare OpenSSL versions and store the newest path/command
-PYTHON_OPENSSL=$(python -c "import ssl; print(ssl.OPENSSL_VERSION)" | sed -n 's/.*OpenSSL \([0-9.]*\).*/\1/p')
+PYTHON_OPENSSL=$(python -c "import ssl; print(ssl.OPENSSL_VERSION)" | sed -n 's/.*OpenSSL \([0-9.]*\).*/\1/p' 2>/dev/null)
 SYSTEM_OPENSSL=$(openssl --version 2>/dev/null | sed -n 's/.*OpenSSL \([0-9.]*\).*/\1/p')
 
 # Use sort -V to find the highest version string
 NEWEST_VERSION=$(printf '%s\n%s\n' "$PYTHON_OPENSSL" "$SYSTEM_OPENSSL" | sort -V | tail -n 1)
 
-if [ "$NEWEST_VERSION" == "$SYSTEM_OPENSSL" ]; then
+if [ "$NEWEST_VERSION" == "$SYSTEM_OPENSSL" ] || [ -z "$PYTHON_OPENSSL" ]; then
   openssl="openssl"
 else
-  openssl="python -c \"import ssl; ...\""
+  openssl="openssl"
 fi
 
-# 13. Locate public and private keys inside the extracted directory by checking headers
-PRIVATE_KEY_FILE=$(grep -l -m 1 "^-----BEGIN RSA PRIVATE KEY-----" "$EXTRACT_DIR"/* 2>/dev/null | head -n 1)
-PUBLIC_KEY_FILE=$(grep -l -m 1 "^-----BEGIN PUBLIC KEY-----" "$EXTRACT_DIR"/* 2>/dev/null | head -n 1)
-
-# Verify both keys were found
+# 13. Locate public and private keys inside the determined directory checking headers
+PRIVATE_KEY_FILE=$(grep -l -m 1 -r "^-----BEGIN RSA PRIVATE KEY-----" "$KEY_SEARCH_DIR" 2>/dev/null | head -n 1)
+PUBLIC_KEY_FILE=$(grep -l -m 1 -r "^-----BEGIN PUBLIC KEY-----" "$KEY_SEARCH_DIR" 2>/dev/null | head -n 1)
 if [ -z "$PRIVATE_KEY_FILE" ] || [ -z "$PUBLIC_KEY_FILE" ]; then
-  echo "Error: Could not find both private and public PEM keys in the extracted files." >&2
-  exit 1
+  if [ "$SKIP_DUMP" = true ]; then
+    PRIVATE_KEY_FILE=$(grep -l -m 1 -r "^-----BEGIN RSA PRIVATE KEY-----" "$EXTRACT_DIR" 2>/dev/null | head -n 1)
+    PUBLIC_KEY_FILE=$(grep -l -m 1 -r "^-----BEGIN PUBLIC KEY-----" "$EXTRACT_DIR" 2>/dev/null | head -n 1)
+  fi
+  # Verify both keys were found
+  if [ -z "$PRIVATE_KEY_FILE" ] || [ -z "$PUBLIC_KEY_FILE" ]; then
+    echo "Error: Could not find both private and public PEM keys in $(cygpath -w "$KEY_SEARCH_DIR")" >&2
+    exit 1
+  fi
 fi
 
-echo "Found Private Key: ${PRIVATE_KEY_FILE##*/}"
-echo "Found Public Key:  ${PUBLIC_KEY_FILE##*/}"
-
-# 14. Define file paths for signing
-INPUT_BIN="$SKETCH_TEMP/$SKETCH_NAME.ino.bin"
-SIGNATURE_FILE="$DUMP_DIR/signature.sign"
-FINAL_OTA_BIN="$DUMP_DIR/ota.bin"
-
-if [ ! -f "$INPUT_BIN" ]; then
-  echo "Error: Source binary '${INPUT_BIN##*/}' not found." >&2
-  exit 1
-fi
-
-# 15. Sign the binary using the determined openssl command
-echo "Signing binary with SHA256..."
-$openssl dgst -sign "$PRIVATE_KEY_FILE" -keyform PEM -sha256 -out "$SIGNATURE_FILE" -binary "$INPUT_BIN"
-
-if [ $? -ne 0 ]; then
-  echo "Error: OpenSSL signing failed." >&2
-  exit 1
-fi
-
-# 16. Concatenate the original binary and the signature into the final OTA file
-echo "Creating final combined OTA binary..."
-cat "$INPUT_BIN" "$SIGNATURE_FILE" > "$FINAL_OTA_BIN"
-
-if [ $? -eq 0 ]; then
-  echo "Success! Combined signed update file created at: $FINAL_OTA_BIN"
-else
-  echo "Error: Failed to combine binary and signature." >&2
-  exit 1
-fi
-
+# Prepare Sketch data directory with keys
+echo "Signing binary images..."
 cp "$PRIVATE_KEY_FILE" "$DUMP_DIR"
 cp "$PUBLIC_KEY_FILE" "$DUMP_DIR"
-cp -a "$EXTRACT_DIR" "$SKETCH_DIR"
+rm -r "$EXTRACT_DIR"
+cp -a "$build_source_path/data" "$build_path" 2>/dev/null || mkdir -p "$EXTRACT_DIR"
+cp "$DUMP_DIR/${PRIVATE_KEY_FILE##*/}" "$EXTRACT_DIR"
+cp "$DUMP_DIR/${PUBLIC_KEY_FILE##*/}" "$EXTRACT_DIR"
+
+# Processing Firmware (App) and Filesystem (LittleFS) loop
+INPUT_APP_BIN="$build_path/$build_project_name.ino.bin"
+FINAL_APP_OTA="$DUMP_DIR/${build_project_name}-ota_${build_chip_variant}-signed.bin"
+FINAL_LFS_OTA="$DUMP_DIR/${build_project_name}-littlefs_${build_chip_variant}-signed.bin"
+
+# Arrays to map the inputs to their targeted OTA outputs
+TARGET_INPUTS=("$INPUT_APP_BIN" "$RAW_LITTLEFS_BIN")
+TARGET_OUTPUTS=("$FINAL_APP_OTA" "$FINAL_LFS_OTA")
+
+# 14. Build clean LittleFS binary image directly from data directory
+"$MKLITTLEFS_EXE" -c "$EXTRACT_DIR" -p 256 -b 4096 -s "$LITTLEFS_SIZE" "$RAW_LITTLEFS_BIN"
+
+if [ $? -ne 0 ] || [ ! -s "$RAW_LITTLEFS_BIN" ]; then
+  echo "Error: Failed to build LittleFS binary image, using Dump." >&2
+  TARGET_INPUTS=("$INPUT_APP_BIN" "$IMAGE_BIN")
+fi
+
+# 15. Compress images: loop over App + LittleFS binaries
+for ((i = 0 ; i < 2 ; i++)); do
+  CURRENT_IN="${TARGET_INPUTS[$i]}"
+  CURRENT_OUT="${TARGET_OUTPUTS[$i]}"
+
+  if [ ! -f "$CURRENT_IN" ]; then
+    echo "Warning: file '${CURRENT_IN##*/}' not found. Skipping."
+    continue
+  fi
+  
+  TMP_ZLIB="$DUMP_DIR/tmp_process.zlib"
+  TMP_SIGN="$DUMP_DIR/tmp_process.sign"
+  
+  # Compress with pigz (-9 = max, -k = keep, -z = zlib format, -c = stdout)
+  "$PIGZ_EXE" -9kzc "$CURRENT_IN" > "$TMP_ZLIB"
+  
+  # Check if pigz successfully created a Zlib file (Magic byte 0x78)
+  if [ "$(od -An -tx1 -N1 "$TMP_ZLIB" | tr -d '[:space:]')" == "78" ]; then
+    $openssl dgst -sign "$PRIVATE_KEY_FILE" -keyform PEM -sha256 -out "$TMP_SIGN" -binary "$TMP_ZLIB"
+    if [ $? -eq 0 ]; then
+      cat "$TMP_ZLIB" "$TMP_SIGN" > "$CURRENT_OUT"
+      echo "-> ${CURRENT_OUT##*/}"
+    else
+      echo "Error: OpenSSL signing failed: ${CURRENT_OUT##*/}" >&2
+    fi
+  else
+    # 16. Fallback if compression failed
+    $openssl dgst -sign "$PRIVATE_KEY_FILE" -keyform PEM -sha256 -out "$TMP_SIGN" -binary "$CURRENT_IN"
+    if [ $? -eq 0 ]; then
+      cat "$CURRENT_IN" "$TMP_SIGN" > "$CURRENT_OUT"
+      echo "-> ${CURRENT_OUT##*/}"
+    else
+      echo "Error: OpenSSL signing failed: ${CURRENT_OUT##*/}" >&2
+    fi
+  fi
+  
+  # Clean up loop assets
+  rm -f "$TMP_ZLIB" "$TMP_SIGN"
+done
+
+# Clean up littlefs build artifact
+rm -f "$RAW_LITTLEFS_BIN"
 
 # 17. Open Windows Explorer in the dump directory
 explorer.exe "$(cygpath -w "$DUMP_DIR")"
