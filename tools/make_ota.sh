@@ -40,6 +40,77 @@
 # limitations under the License.
 # ==============================================================================
 
+
+# Function: openssl_python_wrapper()
+# Emulates the 'openssl' command using Python
+openssl_python_wrapper() {
+  python -c '
+import sys
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.asymmetric import padding
+from cryptography.hazmat.primitives.serialization import load_pem_private_key
+
+args = sys.argv[1:]
+
+if "dgst" in args and "-sign" in args:
+    try:
+        # 1. Dynamically locate flags regardless of their position/order
+        private_key_path = args[args.index("-sign") + 1]
+        output_path = args[args.index("-out") + 1]
+        
+        # 2. Determine the hash algorithm dynamically
+        hash_algo = hashes.SHA256()  # Default fallback
+        for arg in args:
+            if arg.startswith("-sha"):
+                bits = arg.replace("-sha", "")
+                if bits == "256": hash_algo = hashes.SHA256()
+                elif bits == "384": hash_algo = hashes.SHA384()
+                elif bits == "512": hash_algo = hashes.SHA512()
+                elif bits == "224": hash_algo = hashes.SHA224()
+            elif arg == "-md5": hash_algo = hashes.MD5()
+            elif arg == "-sha1": hash_algo = hashes.SHA1()
+
+        # 3. Find the input file (the only positional argument that is not a flag or value)
+        input_path = None
+        skip_next = False
+        for i, arg in enumerate(args):
+            if skip_next:
+                skip_next = False
+                continue
+            if arg in ["-sign", "-out", "-keyform", "-passin"]:
+                skip_next = True
+                continue
+            if arg.startswith("-") or arg == "dgst":
+                continue
+            input_path = arg
+
+        if not input_path:
+            raise ValueError("No input file specified in arguments.")
+
+        # 4. Cryptographic execution
+        with open(private_key_path, "rb") as f:
+            private_key = load_pem_private_key(f.read(), password=None)
+            
+        with open(input_path, "rb") as f:
+            data = f.read()
+            
+        signature = private_key.sign(data, padding.PKCS1v15(), hash_algo)
+        
+        with open(output_path, "wb") as f:
+            f.write(signature)
+            
+        sys.exit(0)
+    except Exception as e:
+        print(f"Python Signer Error: {e}", file=sys.stderr)
+        sys.exit(1)
+else:
+    print(f"Python Signer Error: Unsupported OpenSSL arguments. Args: {args}", file=sys.stderr)
+    sys.exit(1)
+' "$@"
+}
+
+# ==============================================================================
+
 # 1. Determine absolute paths
 SCRIPT_PATH=$(realpath "${0}")
 build_source_path=${SCRIPT_PATH%/*}     # Strips the filename from the back (equivalent to dirname)
@@ -181,16 +252,9 @@ EXTRACT_DIR="$build_path/data"
 mkdir -p "$EXTRACT_DIR"
 
 echo -n "Dumping LittleFS partition... press any key..."
-control_c_handler() {
-  CTRL_C_PRESSED=true
-}
-trap control_c_handler SIGINT
-CTRL_C_PRESSED=false
+read -s -t 30 -n 1 KEY_PRESSED
 SKIP_DUMP=false
-read -s -n 1 KEY_PRESSED
-READ_STATUS=$?
-trap - SIGINT
-if [[ "$KEY_PRESSED" == $'\e' ]] || [ "$CTRL_C_PRESSED" = true ] || [ $READ_STATUS -gt 128 ]; then
+if [[ "$KEY_PRESSED" == $'\e' ]]; then
   SKIP_DUMP=true
   echo " aborted. Using local keys."
   KEY_SEARCH_DIR="$build_source_path/data"
@@ -227,16 +291,23 @@ if [ "$SKIP_DUMP" = false ]; then
 fi
 
 # 12. Compare OpenSSL versions and store the newest path/command
-PYTHON_OPENSSL=$(python -c "import ssl; print(ssl.OPENSSL_VERSION)" | sed -n 's/.*OpenSSL \([0-9.]*\).*/\1/p' 2>/dev/null)
+PYTHON_OPENSSL=$(python -c "import ssl; print(ssl.OPENSSL_VERSION)" | sed -n 's/.*OpenSSL \([0-9.]*\).*/\1/p')
 SYSTEM_OPENSSL=$(openssl --version 2>/dev/null | sed -n 's/.*OpenSSL \([0-9.]*\).*/\1/p')
 
 # Use sort -V to find the highest version string
 NEWEST_VERSION=$(printf '%s\n%s\n' "$PYTHON_OPENSSL" "$SYSTEM_OPENSSL" | sort -V | tail -n 1)
 
-if [ "$NEWEST_VERSION" == "$SYSTEM_OPENSSL" ] || [ -z "$PYTHON_OPENSSL" ]; then
+if [ "$NEWEST_VERSION" == "$SYSTEM_OPENSSL" ]; then
   openssl="openssl"
 else
-  openssl="openssl"
+  if ! python -c "import cryptography" >/dev/null 2>&1; then
+    python -m pip install --user cryptography >/dev/null 2>&1
+    if [ $? -ne 0 ]; then
+      echo "Please update OpenSSL or run: pip install cryptography" >&2
+      exit 1
+    fi
+  fi
+  openssl="openssl_python_wrapper"
 fi
 
 # 13. Locate public and private keys inside the determined directory checking headers
@@ -264,7 +335,7 @@ cp "$DUMP_DIR/${PRIVATE_KEY_FILE##*/}" "$EXTRACT_DIR"
 cp "$DUMP_DIR/${PUBLIC_KEY_FILE##*/}" "$EXTRACT_DIR"
 
 # Processing Firmware (App) and Filesystem (LittleFS) loop
-INPUT_APP_BIN="$build_path/$build_project_name.ino.bin"
+INPUT_APP_BIN="$build_path/${build_project_name}.ino.bin"
 FINAL_APP_OTA="$DUMP_DIR/${build_project_name}-ota_${build_chip_variant}-signed.bin"
 FINAL_LFS_OTA="$DUMP_DIR/${build_project_name}-littlefs_${build_chip_variant}-signed.bin"
 
@@ -290,11 +361,11 @@ for ((i = 0 ; i < 2 ; i++)); do
     continue
   fi
   
-  TMP_ZLIB="$DUMP_DIR/tmp_process.zlib"
-  TMP_SIGN="$DUMP_DIR/tmp_process.sign"
+  TMP_ZLIB="$DUMP_DIR/${CURRENT_IN##*/}.z"
+  TMP_SIGN="$DUMP_DIR/signature.sign"
   
   # Compress with pigz (-9 = max, -k = keep, -z = zlib format, -c = stdout)
-  "$PIGZ_EXE" -9kzc "$CURRENT_IN" > "$TMP_ZLIB"
+  "$PIGZ_EXE" -9kzc "$CURRENT_IN" > "$TMP_ZLIB" 2>/dev/null
   
   # Check if pigz successfully created a Zlib file (Magic byte 0x78)
   if [ "$(od -An -tx1 -N1 "$TMP_ZLIB" | tr -d '[:space:]')" == "78" ]; then
